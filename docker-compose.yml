@@ -1,0 +1,150 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# WhatsApp Bot — Docker Compose
+# Run locally:       docker compose up --build
+# Run production:    docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      POSTGRES_DB: ${DB_NAME:-whatsapp_bot}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-whatsapp_bot}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── WhatsApp Sidecar (Node.js + whatsapp-web.js) ───────────────────────────
+  wa-sidecar:
+    build:
+      context: ./wa-sidecar
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      - PORT=3001
+      - SESSIONS_DIR=/app/sessions
+      - SIDECAR_API_KEY=${SIDECAR_API_KEY:-change-me-in-production}
+    volumes:
+      # Persist WhatsApp session auth data across container restarts
+      - wa_sessions:/app/sessions
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3001/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    # The sidecar does NOT need network access to the DB or Redis.
+    # The backend reaches it by its service name 'wa-sidecar'.
+
+  # ── FastAPI Backend ─────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@db:5432/${DB_NAME:-whatsapp_bot}
+      - REDIS_URL=redis://redis:6379/0
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - JWT_SECRET=${JWT_SECRET:-super-secret-key-change-in-production}
+      # Sidecar connection
+      - WA_SIDECAR_URL=http://wa-sidecar:3001
+      - SIDECAR_API_KEY=${SIDECAR_API_KEY:-change-me-in-production}
+      - WA_SIDECAR_TIMEOUT=12
+      # Provider mode: set to "false" in production to use real WhatsApp
+      - USE_MOCK_PROVIDERS=${USE_MOCK_PROVIDERS:-false}
+      # Optional: Meta Cloud API token for Professional mode (dev only)
+      - META_ACCESS_TOKEN_DEV=${META_ACCESS_TOKEN_DEV:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      wa-sidecar:
+        condition: service_healthy
+
+  # ── Personal Campaign Worker ────────────────────────────────────────────────
+  personal_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: celery -A core.worker.celery_app worker -Q personal_messages --loglevel=info --concurrency=1
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@db:5432/${DB_NAME:-whatsapp_bot}
+      - REDIS_URL=redis://redis:6379/0
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - WA_SIDECAR_URL=http://wa-sidecar:3001
+      - SIDECAR_API_KEY=${SIDECAR_API_KEY:-change-me-in-production}
+      - WA_SIDECAR_TIMEOUT=12
+      - USE_MOCK_PROVIDERS=${USE_MOCK_PROVIDERS:-false}
+    depends_on:
+      - redis
+      - db
+      - wa-sidecar
+
+  # ── Professional Campaign Worker ────────────────────────────────────────────
+  professional_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: celery -A core.worker.celery_app worker -Q professional_messages --loglevel=info --concurrency=4
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@db:5432/${DB_NAME:-whatsapp_bot}
+      - REDIS_URL=redis://redis:6379/0
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - USE_MOCK_PROVIDERS=${USE_MOCK_PROVIDERS:-false}
+      - META_ACCESS_TOKEN_DEV=${META_ACCESS_TOKEN_DEV:-}
+    depends_on:
+      - redis
+      - db
+
+  # ── Next.js Frontend ────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      - NEXT_PUBLIC_API_URL=/api
+      - NODE_ENV=${ENVIRONMENT:-production}
+
+  # ── Nginx Reverse Proxy ─────────────────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-8080}:80"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - backend
+      - frontend
+
+volumes:
+  postgres_data:
+  redis_data:
+  wa_sessions:      # Persists whatsapp-web.js LocalAuth session data
